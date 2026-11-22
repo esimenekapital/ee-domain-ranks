@@ -1,0 +1,143 @@
+# ============================================================================
+#  Update .ee domain ranks  —  free monthly data job for the EE Domain Triage tool
+# ============================================================================
+#  Every Monday this job checks whether Common Crawl has published a new
+#  web graph. If so, it downloads the domain ranks file (~2 GB, 118M domains),
+#  keeps only .ee domains, and saves them to data/ee_ranks.tsv in this
+#  repository. The Google Sheet reads that file every morning.
+#
+#  Cost: free (public repository). No accounts, keys or IP restrictions.
+#  If a run fails, the previous file stays in place and GitHub emails you.
+# ============================================================================
+
+name: Update .ee domain ranks
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'          # every Monday 04:23 UTC
+  workflow_dispatch:              # "Run workflow" button in the Actions tab
+    inputs:
+      force:
+        description: 'Rebuild even if the Common Crawl release has not changed'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                 # to save the data file
+  actions: write                  # to keep this schedule switched on
+
+concurrency:
+  group: ee-ranks
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Get repository
+        uses: actions/checkout@v4
+
+      - name: Find the newest Common Crawl web graph
+        id: rel
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          ids=$(curl -fsS --retry 10 --retry-delay 30 https://index.commoncrawl.org/graphinfo.json \
+                | jq -r '.[0:4][].id')
+          release=""
+          for id in $ids; do
+            [[ "$id" =~ ^cc-main-[a-z0-9-]+$ ]] || continue
+            url="https://data.commoncrawl.org/projects/hyperlinkgraph/$id/domain/$id-domain-ranks.txt.gz"
+            if curl -fsSI --retry 5 --retry-delay 20 "$url" > /dev/null; then
+              release="$id"; break
+            fi
+            echo "Ranks file for $id is not available yet, trying the previous release."
+          done
+          if [ -z "$release" ]; then
+            echo "::error::No downloadable Common Crawl domain ranks file found."; exit 1
+          fi
+          current=""
+          if [ -f data/meta.json ]; then current=$(jq -r '.release // ""' data/meta.json); fi
+          echo "Newest available release: $release | Release already saved: ${current:-none}"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          if [ "$release" != "$current" ] || [ "${FORCE:-false}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date, nothing to download."
+          fi
+
+      - name: Download domain ranks (about 2 GB)
+        if: steps.rel.outputs.build == 'true'
+        env:
+          REL: ${{ steps.rel.outputs.release }}
+        run: |
+          set -euo pipefail
+          url="https://data.commoncrawl.org/projects/hyperlinkgraph/$REL/domain/$REL-domain-ranks.txt.gz"
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fSL --retry 10 --retry-delay 30 -C - -o ranks.txt.gz "$url"; then break; fi
+            echo "Download attempt $attempt was interrupted, resuming in 2 minutes..."
+            sleep 120
+          done
+          gzip -t ranks.txt.gz
+          ls -lh ranks.txt.gz
+
+      - name: Keep only .ee domains
+        if: steps.rel.outputs.build == 'true'
+        env:
+          REL: ${{ steps.rel.outputs.release }}
+          MIN_NODES: '10000000'
+          MIN_EE: '10000'
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          # Columns: harmonic-centrality rank, value, PageRank rank, value, reversed domain, hosts
+          zcat ranks.txt.gz | awk -F'\t' '
+            /^#/ { next }
+            { total++ }
+            $5 ~ /^ee\./ {
+              k = split($5, p, ".")
+              d = p[k]
+              for (i = k - 1; i >= 1; i--) d = d "." p[i]
+              print d "\t" $1 "\t" $3 > "ee_body.tsv"
+              ee++
+            }
+            END { print total + 0 > "count_total.txt"; print ee + 0 > "count_ee.txt" }'
+          total=$(cat count_total.txt); ee=$(cat count_ee.txt)
+          echo "Domains in the web graph: $total | .ee domains: $ee"
+          if [ "$total" -lt "$MIN_NODES" ] || [ "$ee" -lt "$MIN_EE" ]; then
+            echo "::error::Counts look wrong (file format changed?). Keeping the previous data."; exit 1
+          fi
+          built=$(date -u +%Y-%m-%d)
+          {
+            printf '#domain\thc_rank\tpr_rank\trelease=%s\tnodes=%s\tbuilt=%s\n' "$REL" "$total" "$built"
+            cat ee_body.tsv
+          } > data/ee_ranks.tsv
+          jq -n --arg r "$REL" --argjson n "$total" --argjson e "$ee" --arg b "$built" \
+            '{release: $r, nodes: $n, ee_domains: $e, built: $b}' > data/meta.json
+          ls -lh data
+          head -5 data/ee_ranks.tsv
+
+      - name: Save to repository
+        env:
+          REL: ${{ steps.rel.outputs.release }}
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          date -u +%Y-%m-%dT%H:%M:%SZ > data/last_checked.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then echo "Nothing changed."; exit 0; fi
+          git commit -m "Ranks: $REL (checked $(date -u +%Y-%m-%d))"
+          git push
+
+      - name: Keep the weekly schedule switched on
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/update-ranks.yml/enable" \
+            || echo "Could not refresh the schedule (not critical)."
